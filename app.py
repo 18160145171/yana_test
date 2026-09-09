@@ -63,6 +63,11 @@ PROVIDER_PRESETS = {
     "智谱": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4-plus"},
     "Kimi(月之暗面)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
 }
+ENDPOINT_PRESETS = {
+    "自动识别": "auto",
+    "Responses（/v1/responses）": "responses",
+    "Chat Completions（/v1/chat/completions）": "chat_completions",
+}
 CONFIG_PATH = Path.home() / ".testcase_generator_config.json"
 
 
@@ -640,7 +645,15 @@ def _coerce_to_case_list(parsed_json: Any) -> Optional[List[Any]]:
     return None
 
 
-def _repair_with_model(client: OpenAI, model_name: str, raw_text: str) -> str:
+def _repair_with_model(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    raw_text: str,
+    endpoint_mode: str = "auto",
+    proxy_url: str = "",
+    skip_ssl_verify: bool = False,
+) -> str:
     max_chars = 14000
     if len(raw_text) > max_chars:
         raw_text = (
@@ -660,19 +673,18 @@ def _repair_with_model(client: OpenAI, model_name: str, raw_text: str) -> str:
 {raw_text}
 ---
 """.strip()
-    repaired = client.chat.completions.create(
-        model=model_name,
+    return _request_model_with_fallback(
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        system_prompt="你是JSON修复器。只输出一段合法JSON：要么是数组[...]，要么是对象{\"cases\":[...]}。不要代码围栏。",
+        user_prompt=repair_prompt,
+        endpoint_mode=endpoint_mode,
+        proxy_url=proxy_url,
+        skip_ssl_verify=skip_ssl_verify,
         temperature=0,
         max_tokens=8192,
-        messages=[
-            {
-                "role": "system",
-                "content": "你是JSON修复器。只输出一段合法JSON：要么是数组[...]，要么是对象{\"cases\":[...]}。不要代码围栏。",
-            },
-            {"role": "user", "content": repair_prompt},
-        ],
     )
-    return (repaired.choices[0].message.content or "").strip()
 
 
 def _normalize_openai_base_url(base_url: str) -> str:
@@ -704,7 +716,231 @@ def _build_client(
     return OpenAI(**kwargs)
 
 
+class ModelAPIError(RuntimeError):
+    def __init__(self, status_code: int, response_text: str, url: str):
+        self.status_code = status_code
+        self.response_text = response_text
+        self.url = url
+        super().__init__(f"HTTP {status_code}: {response_text[:1000]}")
+
+
+def _resolve_endpoint_mode(endpoint_mode: str, base_url: str, model_name: str) -> str:
+    mode = (endpoint_mode or "auto").strip().lower()
+    if mode in {"responses", "chat_completions"}:
+        return mode
+
+    # GPT-5 系列和未带 /v1 的网关地址优先使用 Responses API。
+    base = (base_url or "").strip().rstrip("/").lower()
+    model = (model_name or "").strip().lower()
+    if model.startswith(("gpt-5", "o1", "o3", "o4")) or not base.endswith("/v1"):
+        return "responses"
+    return "chat_completions"
+
+
+def _endpoint_url(base_url: str, endpoint_mode: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        base = "https://api.openai.com/v1"
+    lower = base.lower()
+    suffix = "/responses" if endpoint_mode == "responses" else "/chat/completions"
+    if lower.endswith(suffix):
+        return base
+    if lower.endswith("/v1"):
+        return base + suffix
+    return base + "/v1" + suffix
+
+
+def _build_http_client(
+    proxy_url: str = "",
+    skip_ssl_verify: bool = False,
+) -> httpx.Client:
+    use_proxy = bool((proxy_url or "").strip())
+    return httpx.Client(
+        timeout=90,
+        verify=(False if skip_ssl_verify else True),
+        proxy=(proxy_url.strip() or None),
+        trust_env=(False if use_proxy else True),
+    )
+
+
+def _extract_response_text(payload: Any) -> str:
+    """兼容 Responses、Chat Completions 以及部分第三方网关的返回格式。"""
+    if isinstance(payload, str):
+        return payload.strip()
+    if not isinstance(payload, dict):
+        return ""
+
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and isinstance(p.get("text"), str)
+                    ]
+                    if parts:
+                        return "".join(parts).strip()
+            text = first.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        parts: List[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+        if parts:
+            return "".join(parts).strip()
+
+    for key in ("content", "text", "result", "data"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _request_model(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    endpoint_mode: str = "auto",
+    proxy_url: str = "",
+    skip_ssl_verify: bool = False,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    resolved_mode = _resolve_endpoint_mode(endpoint_mode, base_url, model_name)
+    url = _endpoint_url(base_url, resolved_mode)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if resolved_mode == "responses":
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
+    else:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+    try:
+        with _build_http_client(proxy_url, skip_ssl_verify) as http_client:
+            response = http_client.post(url, headers=headers, json=payload)
+    except Exception:
+        raise
+
+    response_text = response.text or ""
+    if response.status_code >= 400:
+        raise ModelAPIError(response.status_code, response_text, url)
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response_text
+
+    content = _extract_response_text(response_payload)
+    if content:
+        return content
+
+    raise RuntimeError(
+        f"接口返回成功但无法解析文本（端点：{url}，返回片段：{response_text[:500]}）"
+    )
+
+
+def _request_model_with_fallback(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    endpoint_mode: str = "auto",
+    proxy_url: str = "",
+    skip_ssl_verify: bool = False,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    try:
+        return _request_model(
+            api_key,
+            base_url,
+            model_name,
+            system_prompt,
+            user_prompt,
+            endpoint_mode,
+            proxy_url,
+            skip_ssl_verify,
+            temperature,
+            max_tokens,
+        )
+    except ModelAPIError as error:
+        # 自动模式下，部分旧网关不提供 Responses API，遇到 404/405 时回退旧接口。
+        if (endpoint_mode or "auto").strip().lower() == "auto" and error.status_code in {404, 405}:
+            return _request_model(
+                api_key,
+                base_url,
+                model_name,
+                system_prompt,
+                user_prompt,
+                "chat_completions",
+                proxy_url,
+                skip_ssl_verify,
+                temperature,
+                max_tokens,
+            )
+        raise
+
+
 def _diagnose_exception(e: Exception, base_url: str, model_name: str) -> str:
+    if isinstance(e, ModelAPIError):
+        if e.status_code == 401:
+            return "鉴权失败(401)：API Key 无效、过期或复制不完整。"
+        if e.status_code == 403:
+            return "权限不足(403)：当前 Key 无该模型权限或项目权限不足。"
+        if e.status_code == 404:
+            return f"资源不存在(404)：请检查接口端点、Base URL 或模型名（当前：{model_name}）。"
+        if e.status_code == 429:
+            return "限流/配额不足(429)：请检查额度、并发限制或稍后重试。"
+        return (
+            f"模型接口返回 HTTP {e.status_code}。\n"
+            f"- 当前 Base URL: {base_url or '默认'}\n"
+            f"- 当前模型: {model_name}\n"
+            f"- 返回信息: {e.response_text[:1000]}"
+        )
     if isinstance(e, APIConnectionError):
         cause = str(getattr(e, "__cause__", "")) or str(e)
         extra_405 = ""
@@ -740,6 +976,7 @@ def test_model_connection(
     api_key: str,
     base_url: str,
     model_name: str,
+    endpoint_mode: str = "auto",
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
 ) -> str:
@@ -747,17 +984,17 @@ def test_model_connection(
     if not api_key:
         return "请先填写 API Key。"
     try:
-        client = _build_client(
+        _request_model_with_fallback(
             api_key=api_key,
             base_url=base_url,
+            model_name=model_name,
+            system_prompt="你是一个连接测试助手。只回复 pong。",
+            user_prompt="ping",
+            endpoint_mode=endpoint_mode,
             proxy_url=proxy_url,
             skip_ssl_verify=skip_ssl_verify,
-        )
-        _ = client.chat.completions.create(
-            model=model_name,
             temperature=0,
             max_tokens=5,
-            messages=[{"role": "user", "content": "ping"}],
         )
         return "连接测试成功：鉴权、网络、模型调用均正常。"
     except Exception as e:
@@ -771,6 +1008,7 @@ def call_model_generate_cases(
     model_name: str,
     api_key: str,
     base_url: str,
+    endpoint_mode: str = "auto",
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
 ) -> List[Dict]:
@@ -778,33 +1016,37 @@ def call_model_generate_cases(
     if not api_key:
         raise RuntimeError("请先在侧边栏填写 API Key，或配置 OPENAI_API_KEY 环境变量。")
 
-    client = _build_client(
-        api_key=api_key,
-        base_url=base_url,
-        proxy_url=proxy_url,
-        skip_ssl_verify=skip_ssl_verify,
-    )
     prompt = build_prompt(source_text, case_count_hint, include_p2)
 
     try:
-        completion = client.chat.completions.create(
-            model=model_name,
+        content = _request_model_with_fallback(
+            api_key=api_key,
+            base_url=base_url,
+            model_name=model_name,
+            system_prompt="你是资深测试架构师，只输出 JSON 数组。",
+            user_prompt=prompt,
+            endpoint_mode=endpoint_mode,
+            proxy_url=proxy_url,
+            skip_ssl_verify=skip_ssl_verify,
             temperature=0.2,
-            messages=[
-                {"role": "system", "content": "你是资深测试架构师，只输出 JSON 数组。"},
-                {"role": "user", "content": prompt},
-            ],
         )
     except Exception as e:
         raise RuntimeError(_diagnose_exception(e, base_url=base_url, model_name=model_name)) from e
-    content = (completion.choices[0].message.content or "").strip()
     if not content:
         raise RuntimeError("模型未返回内容，请重试。")
 
     data = parse_cases_from_content(content)
     if not data:
         # 二次纠偏：让模型把非标准输出转成纯 JSON 数组
-        repaired_text = _repair_with_model(client, model_name, content)
+        repaired_text = _repair_with_model(
+            api_key=api_key,
+            base_url=base_url,
+            model_name=model_name,
+            raw_text=content,
+            endpoint_mode=endpoint_mode,
+            proxy_url=proxy_url,
+            skip_ssl_verify=skip_ssl_verify,
+        )
         data = parse_cases_from_content(repaired_text)
     if not data:
         raise RuntimeError("模型返回格式仍不可解析（非标准JSON）。建议切换模型或稍后重试。")
@@ -823,18 +1065,28 @@ def call_model_generate_cases(
             include_p2=include_p2,
         )
         try:
-            supplement_resp = client.chat.completions.create(
-                model=model_name,
+            supplement_content = _request_model_with_fallback(
+                api_key=api_key,
+                base_url=base_url,
+                model_name=model_name,
+                system_prompt="你是资深测试架构师，只输出 JSON 数组。",
+                user_prompt=supplement_prompt,
+                endpoint_mode=endpoint_mode,
+                proxy_url=proxy_url,
+                skip_ssl_verify=skip_ssl_verify,
                 temperature=0.2,
-                messages=[
-                    {"role": "system", "content": "你是资深测试架构师，只输出 JSON 数组。"},
-                    {"role": "user", "content": supplement_prompt},
-                ],
             )
-            supplement_content = (supplement_resp.choices[0].message.content or "").strip()
             supplement_data = parse_cases_from_content(supplement_content)
             if not supplement_data:
-                repaired_text = _repair_with_model(client, model_name, supplement_content)
+                repaired_text = _repair_with_model(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model_name=model_name,
+                    raw_text=supplement_content,
+                    endpoint_mode=endpoint_mode,
+                    proxy_url=proxy_url,
+                    skip_ssl_verify=skip_ssl_verify,
+                )
                 supplement_data = parse_cases_from_content(repaired_text)
             if supplement_data:
                 merged = all_rows + normalize_rows(supplement_data)
@@ -866,6 +1118,7 @@ saved_provider = config.get("provider_select", "Kimi(月之暗面)") if isinstan
 saved_provider = saved_provider if saved_provider in PROVIDER_PRESETS else "Kimi(月之暗面)"
 saved_base_urls = config.get("provider_base_urls", {}) if isinstance(config, dict) else {}
 saved_models = config.get("provider_models", {}) if isinstance(config, dict) else {}
+saved_endpoint_modes = config.get("provider_endpoint_modes", {}) if isinstance(config, dict) else {}
 saved_proxy_url = config.get("proxy_url", "") if isinstance(config, dict) else ""
 saved_skip_ssl_verify = bool(config.get("skip_ssl_verify", False)) if isinstance(config, dict) else False
 
@@ -881,6 +1134,8 @@ if "provider_base_urls" not in st.session_state:
     st.session_state.provider_base_urls = saved_base_urls
 if "provider_models" not in st.session_state:
     st.session_state.provider_models = saved_models
+if "provider_endpoint_modes" not in st.session_state:
+    st.session_state.provider_endpoint_modes = saved_endpoint_modes
 if "base_url_input" not in st.session_state:
     st.session_state.base_url_input = st.session_state.provider_base_urls.get(
         st.session_state.provider_select,
@@ -890,6 +1145,11 @@ if "model_name_input" not in st.session_state:
     st.session_state.model_name_input = st.session_state.provider_models.get(
         st.session_state.provider_select,
         PROVIDER_PRESETS[st.session_state.provider_select]["model"],
+    )
+if "endpoint_mode_input" not in st.session_state:
+    st.session_state.endpoint_mode_input = st.session_state.provider_endpoint_modes.get(
+        st.session_state.provider_select,
+        "auto",
     )
 if "proxy_url_input" not in st.session_state:
     st.session_state.proxy_url_input = saved_proxy_url
@@ -904,6 +1164,7 @@ def on_provider_change():
         st.session_state.provider_keys[prev] = st.session_state.get("api_key_input", "")
         st.session_state.provider_base_urls[prev] = st.session_state.get("base_url_input", "")
         st.session_state.provider_models[prev] = st.session_state.get("model_name_input", "")
+        st.session_state.provider_endpoint_modes[prev] = st.session_state.get("endpoint_mode_input", "auto")
     st.session_state.api_key_input = st.session_state.provider_keys.get(new_provider, "")
     st.session_state.base_url_input = st.session_state.provider_base_urls.get(
         new_provider, PROVIDER_PRESETS[new_provider]["base_url"]
@@ -911,6 +1172,7 @@ def on_provider_change():
     st.session_state.model_name_input = st.session_state.provider_models.get(
         new_provider, PROVIDER_PRESETS[new_provider]["model"]
     )
+    st.session_state.endpoint_mode_input = st.session_state.provider_endpoint_modes.get(new_provider, "auto")
     st.session_state.last_provider = new_provider
     save_local_config(
         {
@@ -918,6 +1180,7 @@ def on_provider_change():
             "provider_keys": st.session_state.provider_keys,
             "provider_base_urls": st.session_state.provider_base_urls,
             "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
             "proxy_url": st.session_state.get("proxy_url_input", ""),
             "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
         }
@@ -933,6 +1196,7 @@ def on_api_key_change():
             "provider_keys": st.session_state.provider_keys,
             "provider_base_urls": st.session_state.provider_base_urls,
             "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
             "proxy_url": st.session_state.get("proxy_url_input", ""),
             "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
         }
@@ -948,6 +1212,7 @@ def on_base_url_change():
             "provider_keys": st.session_state.provider_keys,
             "provider_base_urls": st.session_state.provider_base_urls,
             "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
             "proxy_url": st.session_state.get("proxy_url_input", ""),
             "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
         }
@@ -963,6 +1228,23 @@ def on_model_name_change():
             "provider_keys": st.session_state.provider_keys,
             "provider_base_urls": st.session_state.provider_base_urls,
             "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
+            "proxy_url": st.session_state.get("proxy_url_input", ""),
+            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
+        }
+    )
+
+
+def on_endpoint_mode_change():
+    provider = st.session_state.get("provider_select")
+    st.session_state.provider_endpoint_modes[provider] = st.session_state.get("endpoint_mode_input", "auto")
+    save_local_config(
+        {
+            "provider_select": st.session_state.provider_select,
+            "provider_keys": st.session_state.provider_keys,
+            "provider_base_urls": st.session_state.provider_base_urls,
+            "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
             "proxy_url": st.session_state.get("proxy_url_input", ""),
             "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
         }
@@ -976,6 +1258,7 @@ def on_network_change():
             "provider_keys": st.session_state.provider_keys,
             "provider_base_urls": st.session_state.provider_base_urls,
             "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
             "proxy_url": st.session_state.get("proxy_url_input", ""),
             "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
         }
@@ -1004,6 +1287,16 @@ with st.sidebar:
         help="OpenAI 官方默认 https://api.openai.com/v1；智谱/Kimi 建议使用默认值",
     )
     model_name = st.text_input("模型名称", key="model_name_input", on_change=on_model_name_change)
+    endpoint_mode = st.selectbox(
+        "接口端点",
+        list(ENDPOINT_PRESETS.values()),
+        format_func=lambda mode: next(
+            label for label, value in ENDPOINT_PRESETS.items() if value == mode
+        ),
+        key="endpoint_mode_input",
+        on_change=on_endpoint_mode_change,
+        help="你的模型配置显示为 /v1/responses 时请选择 Responses；不确定时使用自动识别。",
+    )
     if provider == "Kimi(月之暗面)":
         st.caption("Kimi 建议：Base URL 使用 https://api.moonshot.cn/v1，模型如 moonshot-v1-8k。")
     if provider == "GPT(OpenAI)":
@@ -1034,6 +1327,7 @@ if test_conn_btn:
             api_key=st.session_state.get("api_key_input", ""),
             base_url=st.session_state.get("base_url_input", ""),
             model_name=st.session_state.get("model_name_input", ""),
+            endpoint_mode=st.session_state.get("endpoint_mode_input", "auto"),
             proxy_url=st.session_state.get("proxy_url_input", ""),
             skip_ssl_verify=bool(st.session_state.get("skip_ssl_verify_input", False)),
         )
@@ -1081,6 +1375,7 @@ if gen_btn:
                     model_name=model_name.strip() or DEFAULT_MODEL,
                     api_key=api_key_input,
                     base_url=base_url_input,
+                    endpoint_mode=st.session_state.get("endpoint_mode_input", "auto"),
                     proxy_url=st.session_state.get("proxy_url_input", ""),
                     skip_ssl_verify=bool(st.session_state.get("skip_ssl_verify_input", False)),
                 )
