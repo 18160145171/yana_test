@@ -1,0 +1,20 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Build and packaged application output
+build/
+dist/
+
+# Local tools and runtime logs
+tools/
+*.log
+
+# Local secrets and Streamlit credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
