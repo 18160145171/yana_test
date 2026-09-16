@@ -5,6 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pandas as pd
@@ -57,17 +58,60 @@ COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 PROVIDER_PRESETS = {
-    "GPT(OpenAI)": {"base_url": "https://api.openai.com/v1", "model": "gpt-4.1"},
-    "OpenAI兼容": {"base_url": "", "model": DEFAULT_MODEL},
+    "GPT(OpenAI)": {
+        "base_url": "https://api.openai.com/v1",
+        "display_name": "gpt-4.1",
+        "model": "gpt-4.1",
+        "endpoint_mode": "auto",
+        "reasoning_effort": "",
+        "max_output_tokens": "",
+    },
+    "5spiritual（Responses）": {
+        "base_url": "https://5spiritual.com",
+        "display_name": "gpt-5.5",
+        "model": "openai/gpt-5.5",
+        "endpoint_mode": "responses",
+        "reasoning_effort": "medium",
+        "max_output_tokens": "",
+    },
+    "OpenAI兼容": {
+        "base_url": "",
+        "display_name": DEFAULT_MODEL,
+        "model": DEFAULT_MODEL,
+        "endpoint_mode": "auto",
+        "reasoning_effort": "",
+        "max_output_tokens": "",
+    },
     # 智谱 OpenAI 兼容根路径，末尾 / 与官方文档一致，避免与部分旧版客户端拼接路径异常
-    "智谱": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4-plus"},
-    "Kimi(月之暗面)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
+    "智谱": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "display_name": "glm-4-plus",
+        "model": "glm-4-plus",
+        "endpoint_mode": "auto",
+        "reasoning_effort": "",
+        "max_output_tokens": "",
+    },
+    "Kimi(月之暗面)": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "display_name": "moonshot-v1-8k",
+        "model": "moonshot-v1-8k",
+        "endpoint_mode": "auto",
+        "reasoning_effort": "",
+        "max_output_tokens": "",
+    },
 }
 ENDPOINT_PRESETS = {
     "自动识别": "auto",
     "Responses（/v1/responses）": "responses",
     "Chat Completions（/v1/chat/completions）": "chat_completions",
 }
+REASONING_PRESETS = {
+    "默认": "",
+    "低": "low",
+    "中": "medium",
+    "高": "high",
+}
+MODEL_READ_TIMEOUT_SECONDS = 600
 CONFIG_PATH = Path.home() / ".testcase_generator_config.json"
 
 
@@ -75,14 +119,29 @@ def load_local_config() -> Dict:
     if not CONFIG_PATH.exists():
         return {}
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        # 兼容旧版本：移除曾经落盘保存的 API Key。
+        if "provider_keys" in data:
+            data.pop("provider_keys", None)
+            try:
+                CONFIG_PATH.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return data
     except Exception:
         return {}
 
 
 def save_local_config(data: Dict) -> None:
     try:
-        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # API Key 仅保留在当前浏览器会话，不能落盘或随项目提交。
+        safe_data = {key: value for key, value in data.items() if key != "provider_keys"}
+        CONFIG_PATH.write_text(json.dumps(safe_data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         # 本地保存失败不影响主流程
         pass
@@ -651,6 +710,8 @@ def _repair_with_model(
     model_name: str,
     raw_text: str,
     endpoint_mode: str = "auto",
+    reasoning_effort: str = "",
+    max_output_tokens: Optional[int] = None,
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
 ) -> str:
@@ -680,10 +741,11 @@ def _repair_with_model(
         system_prompt="你是JSON修复器。只输出一段合法JSON：要么是数组[...]，要么是对象{\"cases\":[...]}。不要代码围栏。",
         user_prompt=repair_prompt,
         endpoint_mode=endpoint_mode,
+        reasoning_effort=reasoning_effort,
         proxy_url=proxy_url,
         skip_ssl_verify=skip_ssl_verify,
         temperature=0,
-        max_tokens=8192,
+        max_tokens=max_output_tokens or 8192,
     )
 
 
@@ -725,14 +787,19 @@ class ModelAPIError(RuntimeError):
 
 
 def _resolve_endpoint_mode(endpoint_mode: str, base_url: str, model_name: str) -> str:
+    base = (base_url or "").strip().rstrip("/").lower()
+    model = (model_name or "").strip().lower()
+    hostname = (urlparse(base).hostname or "").lower()
+    if hostname in {"5spiritual.com", "www.5spiritual.com"}:
+        return "responses"
+
     mode = (endpoint_mode or "auto").strip().lower()
     if mode in {"responses", "chat_completions"}:
         return mode
 
-    # GPT-5 系列和未带 /v1 的网关地址优先使用 Responses API。
-    base = (base_url or "").strip().rstrip("/").lower()
-    model = (model_name or "").strip().lower()
-    if model.startswith(("gpt-5", "o1", "o3", "o4")) or not base.endswith("/v1"):
+    if hostname in {"api.openai.com", "api.openai.com."} and model.startswith(
+        ("gpt-5", "o1", "o3", "o4")
+    ):
         return "responses"
     return "chat_completions"
 
@@ -756,7 +823,12 @@ def _build_http_client(
 ) -> httpx.Client:
     use_proxy = bool((proxy_url or "").strip())
     return httpx.Client(
-        timeout=90,
+        timeout=httpx.Timeout(
+            connect=20,
+            read=MODEL_READ_TIMEOUT_SECONDS,
+            write=30,
+            pool=20,
+        ),
         verify=(False if skip_ssl_verify else True),
         proxy=(proxy_url.strip() or None),
         trust_env=(False if use_proxy else True),
@@ -825,6 +897,7 @@ def _request_model(
     system_prompt: str,
     user_prompt: str,
     endpoint_mode: str = "auto",
+    reasoning_effort: str = "",
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
     temperature: Optional[float] = None,
@@ -846,6 +919,8 @@ def _request_model(
         }
         if max_tokens is not None:
             payload["max_output_tokens"] = max_tokens
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
     else:
         payload = {
             "model": model_name,
@@ -889,6 +964,7 @@ def _request_model_with_fallback(
     system_prompt: str,
     user_prompt: str,
     endpoint_mode: str = "auto",
+    reasoning_effort: str = "",
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
     temperature: Optional[float] = None,
@@ -902,6 +978,7 @@ def _request_model_with_fallback(
             system_prompt,
             user_prompt,
             endpoint_mode,
+            reasoning_effort,
             proxy_url,
             skip_ssl_verify,
             temperature,
@@ -917,6 +994,7 @@ def _request_model_with_fallback(
                 system_prompt,
                 user_prompt,
                 "chat_completions",
+                "",
                 proxy_url,
                 skip_ssl_verify,
                 temperature,
@@ -925,7 +1003,22 @@ def _request_model_with_fallback(
         raise
 
 
-def _diagnose_exception(e: Exception, base_url: str, model_name: str) -> str:
+def _diagnose_exception(
+    e: Exception,
+    base_url: str,
+    model_name: str,
+    endpoint_mode: str = "auto",
+) -> str:
+    if isinstance(e, httpx.TimeoutException):
+        resolved_mode = _resolve_endpoint_mode(endpoint_mode, base_url, model_name)
+        url = _endpoint_url(base_url, resolved_mode)
+        return (
+            f"模型调用超时：服务端在 {MODEL_READ_TIMEOUT_SECONDS} 秒内没有返回结果。\n"
+            f"- 当前端点: {url}\n"
+            f"- 当前模型: {model_name}\n"
+            "- 请确认模型标识与供应商后台完全一致（例如 openai/gpt-5.5），"
+            "并确认接口端点与后台配置一致；如果仍超时，说明该网关或模型当前不可用。"
+        )
     if isinstance(e, ModelAPIError):
         if e.status_code == 401:
             return "鉴权失败(401)：API Key 无效、过期或复制不完整。"
@@ -977,12 +1070,14 @@ def test_model_connection(
     base_url: str,
     model_name: str,
     endpoint_mode: str = "auto",
+    reasoning_effort: str = "",
+    max_output_tokens: Optional[int] = None,
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
 ) -> str:
-    api_key = (api_key or "").strip()
+    api_key = (api_key or "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return "请先填写 API Key。"
+        return "请先填写 API Key，或在运行环境配置 OPENAI_API_KEY。"
     try:
         _request_model_with_fallback(
             api_key=api_key,
@@ -991,14 +1086,20 @@ def test_model_connection(
             system_prompt="你是一个连接测试助手。只回复 pong。",
             user_prompt="ping",
             endpoint_mode=endpoint_mode,
+            reasoning_effort=reasoning_effort,
             proxy_url=proxy_url,
             skip_ssl_verify=skip_ssl_verify,
             temperature=0,
-            max_tokens=5,
+            max_tokens=max_output_tokens or 5,
         )
         return "连接测试成功：鉴权、网络、模型调用均正常。"
     except Exception as e:
-        return _diagnose_exception(e, base_url=base_url, model_name=model_name)
+        return _diagnose_exception(
+            e,
+            base_url=base_url,
+            model_name=model_name,
+            endpoint_mode=endpoint_mode,
+        )
 
 
 def call_model_generate_cases(
@@ -1009,6 +1110,8 @@ def call_model_generate_cases(
     api_key: str,
     base_url: str,
     endpoint_mode: str = "auto",
+    reasoning_effort: str = "",
+    max_output_tokens: Optional[int] = None,
     proxy_url: str = "",
     skip_ssl_verify: bool = False,
 ) -> List[Dict]:
@@ -1026,12 +1129,21 @@ def call_model_generate_cases(
             system_prompt="你是资深测试架构师，只输出 JSON 数组。",
             user_prompt=prompt,
             endpoint_mode=endpoint_mode,
+            reasoning_effort=reasoning_effort,
             proxy_url=proxy_url,
             skip_ssl_verify=skip_ssl_verify,
             temperature=0.2,
+            max_tokens=max_output_tokens,
         )
     except Exception as e:
-        raise RuntimeError(_diagnose_exception(e, base_url=base_url, model_name=model_name)) from e
+        raise RuntimeError(
+            _diagnose_exception(
+                e,
+                base_url=base_url,
+                model_name=model_name,
+                endpoint_mode=endpoint_mode,
+            )
+        ) from e
     if not content:
         raise RuntimeError("模型未返回内容，请重试。")
 
@@ -1044,6 +1156,8 @@ def call_model_generate_cases(
             model_name=model_name,
             raw_text=content,
             endpoint_mode=endpoint_mode,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
             proxy_url=proxy_url,
             skip_ssl_verify=skip_ssl_verify,
         )
@@ -1072,9 +1186,11 @@ def call_model_generate_cases(
                 system_prompt="你是资深测试架构师，只输出 JSON 数组。",
                 user_prompt=supplement_prompt,
                 endpoint_mode=endpoint_mode,
+                reasoning_effort=reasoning_effort,
                 proxy_url=proxy_url,
                 skip_ssl_verify=skip_ssl_verify,
                 temperature=0.2,
+                max_tokens=max_output_tokens,
             )
             supplement_data = parse_cases_from_content(supplement_content)
             if not supplement_data:
@@ -1084,6 +1200,8 @@ def call_model_generate_cases(
                     model_name=model_name,
                     raw_text=supplement_content,
                     endpoint_mode=endpoint_mode,
+                    reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_output_tokens,
                     proxy_url=proxy_url,
                     skip_ssl_verify=skip_ssl_verify,
                 )
@@ -1113,12 +1231,16 @@ st.title("测试用例生成器")
 st.caption("支持导入 txt/docx/pdf 或粘贴文本，调用模型自动生成并导出 Excel。")
 
 config = load_local_config()
-saved_keys = config.get("provider_keys", {}) if isinstance(config, dict) else {}
+# API Key 不从本机配置恢复，只在当前浏览器会话中保留。
+saved_keys = {}
 saved_provider = config.get("provider_select", "Kimi(月之暗面)") if isinstance(config, dict) else "Kimi(月之暗面)"
 saved_provider = saved_provider if saved_provider in PROVIDER_PRESETS else "Kimi(月之暗面)"
 saved_base_urls = config.get("provider_base_urls", {}) if isinstance(config, dict) else {}
 saved_models = config.get("provider_models", {}) if isinstance(config, dict) else {}
+saved_display_names = config.get("provider_display_names", {}) if isinstance(config, dict) else {}
 saved_endpoint_modes = config.get("provider_endpoint_modes", {}) if isinstance(config, dict) else {}
+saved_reasoning_efforts = config.get("provider_reasoning_efforts", {}) if isinstance(config, dict) else {}
+saved_max_output_tokens = config.get("provider_max_output_tokens", {}) if isinstance(config, dict) else {}
 saved_proxy_url = config.get("proxy_url", "") if isinstance(config, dict) else ""
 saved_skip_ssl_verify = bool(config.get("skip_ssl_verify", False)) if isinstance(config, dict) else False
 
@@ -1134,8 +1256,14 @@ if "provider_base_urls" not in st.session_state:
     st.session_state.provider_base_urls = saved_base_urls
 if "provider_models" not in st.session_state:
     st.session_state.provider_models = saved_models
+if "provider_display_names" not in st.session_state:
+    st.session_state.provider_display_names = saved_display_names
 if "provider_endpoint_modes" not in st.session_state:
     st.session_state.provider_endpoint_modes = saved_endpoint_modes
+if "provider_reasoning_efforts" not in st.session_state:
+    st.session_state.provider_reasoning_efforts = saved_reasoning_efforts
+if "provider_max_output_tokens" not in st.session_state:
+    st.session_state.provider_max_output_tokens = saved_max_output_tokens
 if "base_url_input" not in st.session_state:
     st.session_state.base_url_input = st.session_state.provider_base_urls.get(
         st.session_state.provider_select,
@@ -1146,15 +1274,93 @@ if "model_name_input" not in st.session_state:
         st.session_state.provider_select,
         PROVIDER_PRESETS[st.session_state.provider_select]["model"],
     )
+if "display_name_input" not in st.session_state:
+    st.session_state.display_name_input = st.session_state.provider_display_names.get(
+        st.session_state.provider_select,
+        PROVIDER_PRESETS[st.session_state.provider_select]["display_name"],
+    )
 if "endpoint_mode_input" not in st.session_state:
     st.session_state.endpoint_mode_input = st.session_state.provider_endpoint_modes.get(
         st.session_state.provider_select,
-        "auto",
+        PROVIDER_PRESETS[st.session_state.provider_select]["endpoint_mode"],
+    )
+if "reasoning_effort_input" not in st.session_state:
+    st.session_state.reasoning_effort_input = st.session_state.provider_reasoning_efforts.get(
+        st.session_state.provider_select,
+        PROVIDER_PRESETS[st.session_state.provider_select]["reasoning_effort"],
+    )
+if "max_output_tokens_input" not in st.session_state:
+    st.session_state.max_output_tokens_input = str(
+        st.session_state.provider_max_output_tokens.get(
+            st.session_state.provider_select,
+            PROVIDER_PRESETS[st.session_state.provider_select]["max_output_tokens"],
+        )
     )
 if "proxy_url_input" not in st.session_state:
     st.session_state.proxy_url_input = saved_proxy_url
 if "skip_ssl_verify_input" not in st.session_state:
     st.session_state.skip_ssl_verify_input = saved_skip_ssl_verify
+
+
+def is_5spiritual_base_url(base_url: str) -> bool:
+    hostname = (urlparse((base_url or "").strip()).hostname or "").lower()
+    return hostname in {"5spiritual.com", "www.5spiritual.com"}
+
+
+def apply_5spiritual_defaults() -> None:
+    if not is_5spiritual_base_url(st.session_state.get("base_url_input", "")):
+        return
+
+    preset = PROVIDER_PRESETS["5spiritual（Responses）"]
+    st.session_state.endpoint_mode_input = "responses"
+    st.session_state.reasoning_effort_input = st.session_state.get("reasoning_effort_input") or "medium"
+
+    current_model = (st.session_state.get("model_name_input", "") or "").strip()
+    if current_model in {"", "gpt-4.1", "gpt-4o", DEFAULT_MODEL}:
+        st.session_state.model_name_input = preset["model"]
+
+    current_display_name = (st.session_state.get("display_name_input", "") or "").strip()
+    if current_display_name in {"", "gpt-4.1", "gpt-4o", DEFAULT_MODEL}:
+        st.session_state.display_name_input = preset["display_name"]
+
+    provider = st.session_state.get("provider_select")
+    if provider:
+        st.session_state.provider_endpoint_modes[provider] = st.session_state.endpoint_mode_input
+        st.session_state.provider_reasoning_efforts[provider] = st.session_state.reasoning_effort_input
+        st.session_state.provider_models[provider] = st.session_state.model_name_input
+        st.session_state.provider_display_names[provider] = st.session_state.display_name_input
+
+
+apply_5spiritual_defaults()
+
+
+def save_runtime_config() -> None:
+    save_local_config(
+        {
+            "provider_select": st.session_state.provider_select,
+            "provider_base_urls": st.session_state.provider_base_urls,
+            "provider_display_names": st.session_state.provider_display_names,
+            "provider_models": st.session_state.provider_models,
+            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
+            "provider_reasoning_efforts": st.session_state.provider_reasoning_efforts,
+            "provider_max_output_tokens": st.session_state.provider_max_output_tokens,
+            "proxy_url": st.session_state.get("proxy_url_input", ""),
+            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
+        }
+    )
+
+
+def parse_max_output_tokens(raw_value: str) -> Optional[int]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("最大输出 Token 必须是正整数，或留空使用供应商默认值。") from exc
+    if value <= 0:
+        raise ValueError("最大输出 Token 必须是正整数，或留空使用供应商默认值。")
+    return value
 
 
 def on_provider_change():
@@ -1164,7 +1370,10 @@ def on_provider_change():
         st.session_state.provider_keys[prev] = st.session_state.get("api_key_input", "")
         st.session_state.provider_base_urls[prev] = st.session_state.get("base_url_input", "")
         st.session_state.provider_models[prev] = st.session_state.get("model_name_input", "")
+        st.session_state.provider_display_names[prev] = st.session_state.get("display_name_input", "")
         st.session_state.provider_endpoint_modes[prev] = st.session_state.get("endpoint_mode_input", "auto")
+        st.session_state.provider_reasoning_efforts[prev] = st.session_state.get("reasoning_effort_input", "")
+        st.session_state.provider_max_output_tokens[prev] = st.session_state.get("max_output_tokens_input", "")
     st.session_state.api_key_input = st.session_state.provider_keys.get(new_provider, "")
     st.session_state.base_url_input = st.session_state.provider_base_urls.get(
         new_provider, PROVIDER_PRESETS[new_provider]["base_url"]
@@ -1172,97 +1381,78 @@ def on_provider_change():
     st.session_state.model_name_input = st.session_state.provider_models.get(
         new_provider, PROVIDER_PRESETS[new_provider]["model"]
     )
-    st.session_state.endpoint_mode_input = st.session_state.provider_endpoint_modes.get(new_provider, "auto")
-    st.session_state.last_provider = new_provider
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
+    st.session_state.display_name_input = st.session_state.provider_display_names.get(
+        new_provider, PROVIDER_PRESETS[new_provider]["display_name"]
     )
+    st.session_state.endpoint_mode_input = st.session_state.provider_endpoint_modes.get(
+        new_provider, PROVIDER_PRESETS[new_provider]["endpoint_mode"]
+    )
+    st.session_state.reasoning_effort_input = st.session_state.provider_reasoning_efforts.get(
+        new_provider, PROVIDER_PRESETS[new_provider]["reasoning_effort"]
+    )
+    st.session_state.max_output_tokens_input = str(
+        st.session_state.provider_max_output_tokens.get(
+            new_provider, PROVIDER_PRESETS[new_provider]["max_output_tokens"]
+        )
+    )
+    st.session_state.last_provider = new_provider
+    save_runtime_config()
 
 
 def on_api_key_change():
     provider = st.session_state.get("provider_select")
     st.session_state.provider_keys[provider] = st.session_state.get("api_key_input", "")
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
-    )
+
+
+def clear_api_key():
+    provider = st.session_state.get("provider_select")
+    st.session_state.provider_keys[provider] = ""
+    st.session_state.api_key_input = ""
 
 
 def on_base_url_change():
     provider = st.session_state.get("provider_select")
     st.session_state.provider_base_urls[provider] = st.session_state.get("base_url_input", "")
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
-    )
+    apply_5spiritual_defaults()
+    save_runtime_config()
+
+
+def on_display_name_change():
+    provider = st.session_state.get("provider_select")
+    st.session_state.provider_display_names[provider] = st.session_state.get("display_name_input", "")
+    save_runtime_config()
 
 
 def on_model_name_change():
     provider = st.session_state.get("provider_select")
     st.session_state.provider_models[provider] = st.session_state.get("model_name_input", "")
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
-    )
+    save_runtime_config()
 
 
 def on_endpoint_mode_change():
     provider = st.session_state.get("provider_select")
     st.session_state.provider_endpoint_modes[provider] = st.session_state.get("endpoint_mode_input", "auto")
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
+    save_runtime_config()
+
+
+def on_reasoning_effort_change():
+    provider = st.session_state.get("provider_select")
+    st.session_state.provider_reasoning_efforts[provider] = st.session_state.get(
+        "reasoning_effort_input", ""
     )
+    save_runtime_config()
+
+
+def on_max_output_tokens_change():
+    provider = st.session_state.get("provider_select")
+    st.session_state.provider_max_output_tokens[provider] = st.session_state.get(
+        "max_output_tokens_input", ""
+    )
+    save_runtime_config()
 
 
 def on_network_change():
-    save_local_config(
-        {
-            "provider_select": st.session_state.provider_select,
-            "provider_keys": st.session_state.provider_keys,
-            "provider_base_urls": st.session_state.provider_base_urls,
-            "provider_models": st.session_state.provider_models,
-            "provider_endpoint_modes": st.session_state.provider_endpoint_modes,
-            "proxy_url": st.session_state.get("proxy_url_input", ""),
-            "skip_ssl_verify": st.session_state.get("skip_ssl_verify_input", False),
-        }
-    )
+    save_runtime_config()
 
 
 with st.sidebar:
@@ -1273,20 +1463,69 @@ with st.sidebar:
         key="provider_select",
         on_change=on_provider_change,
     )
+    st.markdown(
+        """
+        <style>
+        [data-testid="stTextInput"]:has(input[type="password"]) input[type="password"] {
+            user-select: none;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-user-modify: read-write-plaintext-only;
+        }
+        [data-testid="stTextInput"]:has(input[type="password"]) input[type="password"]::-ms-reveal,
+        [data-testid="stTextInput"]:has(input[type="password"]) input[type="password"]::-ms-clear {
+            display: none !important;
+            width: 0 !important;
+            height: 0 !important;
+        }
+        [data-testid="stTextInput"]:has(input[type="password"]) input[type="password"]::-webkit-credentials-auto-fill-button {
+            visibility: hidden !important;
+            display: none !important;
+            pointer-events: none !important;
+        }
+        [data-testid="stTextInput"]:has(input[type="password"]) button[aria-label="Show password text"],
+        [data-testid="stTextInput"]:has(input[type="password"]) button[aria-label="Hide password text"],
+        [data-testid="stTextInput"]:has(input[type="password"]) button[title="Show password text"],
+        [data-testid="stTextInput"]:has(input[type="password"]) button[title="Hide password text"] {
+            display: none !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+        }
+        [data-testid="stTextInput"]:has(input[type="password"]) input[type="password"] {
+            padding-right: 0.75rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     api_key_input = st.text_input(
-        "API Key",
+        "API Key（隐藏，可粘贴）",
         key="api_key_input",
         type="password",
         on_change=on_api_key_change,
-        help="按模型分别记忆，并保存到本机当前用户目录。",
+        help="不会显示或提供复制入口；可直接粘贴新的 Key。留空时使用运行环境中的 OPENAI_API_KEY（如已配置）。",
     )
+    st.button("清空后粘贴新的 API Key", on_click=clear_api_key, use_container_width=True)
     base_url_input = st.text_input(
         "Base URL",
         key="base_url_input",
         on_change=on_base_url_change,
         help="OpenAI 官方默认 https://api.openai.com/v1；智谱/Kimi 建议使用默认值",
     )
-    model_name = st.text_input("模型名称", key="model_name_input", on_change=on_model_name_change)
+    display_name = st.text_input(
+        "显示名称",
+        key="display_name_input",
+        on_change=on_display_name_change,
+        help="仅用于界面显示，不会发送给模型接口。",
+    )
+    model_name = st.text_input(
+        "模型标识",
+        key="model_name_input",
+        on_change=on_model_name_change,
+        help="必须填写供应商后台提供的实际模型标识。",
+    )
     endpoint_mode = st.selectbox(
         "接口端点",
         list(ENDPOINT_PRESETS.values()),
@@ -1297,10 +1536,33 @@ with st.sidebar:
         on_change=on_endpoint_mode_change,
         help="你的模型配置显示为 /v1/responses 时请选择 Responses；不确定时使用自动识别。",
     )
+    reasoning_effort = st.selectbox(
+        "推理强度",
+        list(REASONING_PRESETS.values()),
+        format_func=lambda value: next(
+            label for label, option in REASONING_PRESETS.items() if option == value
+        ),
+        key="reasoning_effort_input",
+        on_change=on_reasoning_effort_change,
+        help="仅 Responses 接口会发送该参数；Chat Completions 接口会忽略它。",
+    )
+    max_output_tokens_input = st.text_input(
+        "最大输出 Token（可选）",
+        key="max_output_tokens_input",
+        on_change=on_max_output_tokens_change,
+        help="留空使用供应商默认值，填写正整数可限制模型输出长度。",
+    )
+    try:
+        max_output_tokens = parse_max_output_tokens(max_output_tokens_input)
+    except ValueError as exc:
+        max_output_tokens = None
+        st.warning(str(exc))
     if provider == "Kimi(月之暗面)":
         st.caption("Kimi 建议：Base URL 使用 https://api.moonshot.cn/v1，模型如 moonshot-v1-8k。")
     if provider == "GPT(OpenAI)":
         st.caption("GPT 建议：Base URL 使用 https://api.openai.com/v1，模型如 gpt-4.1 / gpt-4o。")
+    if base_url_input.strip().lower().find("5spiritual.com") >= 0:
+        st.caption("5spiritual 模型标识必须与后台列表完全一致，建议填写 openai/gpt-5.5；接口端点建议选 Responses。")
     case_count_hint = st.number_input("期望最少用例数", min_value=10, max_value=500, value=20, step=5)
     include_p2 = st.checkbox("大版本模式（包含 P2 全量）", value=True)
     with st.expander("网络高级设置", expanded=False):
@@ -1328,6 +1590,8 @@ if test_conn_btn:
             base_url=st.session_state.get("base_url_input", ""),
             model_name=st.session_state.get("model_name_input", ""),
             endpoint_mode=st.session_state.get("endpoint_mode_input", "auto"),
+            reasoning_effort=st.session_state.get("reasoning_effort_input", ""),
+            max_output_tokens=max_output_tokens,
             proxy_url=st.session_state.get("proxy_url_input", ""),
             skip_ssl_verify=bool(st.session_state.get("skip_ssl_verify_input", False)),
         )
@@ -1376,6 +1640,8 @@ if gen_btn:
                     api_key=api_key_input,
                     base_url=base_url_input,
                     endpoint_mode=st.session_state.get("endpoint_mode_input", "auto"),
+                    reasoning_effort=st.session_state.get("reasoning_effort_input", ""),
+                    max_output_tokens=max_output_tokens,
                     proxy_url=st.session_state.get("proxy_url_input", ""),
                     skip_ssl_verify=bool(st.session_state.get("skip_ssl_verify_input", False)),
                 )

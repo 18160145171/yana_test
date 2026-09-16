@@ -12,6 +12,7 @@ dist/
 # Local tools and runtime logs
 tools/
 *.log
+.playwright-mcp/
 
 # Local secrets and Streamlit credentials
 .env

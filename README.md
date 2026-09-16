@@ -30,15 +30,24 @@ $env:OPENAI_API_KEY="你的API_KEY"
 
 - API 提供方：`智谱`
 - Base URL：`https://open.bigmodel.cn/api/paas/v4`
-- 模型名称：`glm-4-plus`（或你有权限的其他模型）
+- 模型标识：`glm-4-plus`（或你有权限的其他模型）
 - API Key：你的智谱 Key
 
 ### Kimi API 配置示例
 
 - API 提供方：`Kimi(月之暗面)`
 - Base URL：`https://api.moonshot.cn/v1`
-- 模型名称：`moonshot-v1-8k`（或你有权限的 Kimi 模型）
+- 模型标识：`moonshot-v1-8k`（或你有权限的 Kimi 模型）
 - API Key：你的 Kimi Key
+
+### 5spiritual API 配置示例
+
+- API 提供方：`5spiritual（Responses）`
+- Base URL：`https://5spiritual.com`
+- 模型标识：`openai/gpt-5.5`
+- 接口端点：`Responses（/v1/responses）`
+- 推理强度：`中`
+- API Key：你的 5spiritual Key
 
 可选：设置模型名（默认 `gpt-5.3-codex-fast`）：
 
